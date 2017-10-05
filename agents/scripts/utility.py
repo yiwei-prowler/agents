@@ -30,6 +30,7 @@ from agents import tools
 
 def define_simulation_graph(batch_env, algo_cls, config):
   """Define the algortihm and environment interaction.
+  Simulate a single step in all environments. See more details in `tools.simulate`.
 
   Args:
     batch_env: In-graph environments object.

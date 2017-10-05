@@ -22,7 +22,10 @@ import tensorflow as tf
 
 
 class EpisodeMemory(object):
-  """Memory that stores episodes."""
+  """Memory that stores episodes.
+  Picture of the memory: each row is for a single environment, and each row can store
+  up to max_length number of experience records.
+  """
 
   def __init__(self, template, capacity, max_length, scope):
     """Create a memory that stores episodes.
@@ -56,6 +59,8 @@ class EpisodeMemory(object):
 
     Returns:
       Batch tensor of sequence lengths.
+      Each element in the tensor shows how many episodes we have collected
+      for the corresponding environment given by indices of rows.
     """
     rows = tf.range(self._capacity) if rows is None else rows
     return tf.gather(self._length, rows)
@@ -72,19 +77,34 @@ class EpisodeMemory(object):
     """
     rows = tf.range(self._capacity) if rows is None else rows
     assert rows.shape.ndims == 1
+    # Check that the indices given in rows are smaller than self._capacity, which is the number
+    # of rows (or equivalently, the number of environments).
     assert_capacity = tf.assert_less(
         rows, self._capacity,
         message='capacity exceeded')
+
+    # Check that the needed rows all have at least a single slot of space to store the
+    # new experience records (one record per row, or per environment).
     with tf.control_dependencies([assert_capacity]):
       assert_max_length = tf.assert_less(
           tf.gather(self._length, rows), self._max_length,
           message='max length exceeded')
+
     append_ops = []
     with tf.control_dependencies([assert_max_length]):
       for buffer_, elements in zip(self._buffers, transitions):
         timestep = tf.gather(self._length, rows)
         indices = tf.stack([rows, timestep], 1)
         append_ops.append(tf.scatter_nd_update(buffer_, indices, elements))
+
+    # Add one to all the rows with new experience record.
+    # tf.one_hot(rows, self._capacity, dtype=tf.int32) give a list of one-hot representations
+    # for each environment specified in rows, something like:
+    # [array([[0, 1, 0, 0, 0, 0],
+    #         [0, 0, 1, 0, 0, 0],
+    #         [0, 0, 0, 1, 0, 0]], dtype=int32)]
+    # So the reduce_sum operator is needed to generate the row indices needed to
+    # update the self._length tensor.
     with tf.control_dependencies(append_ops):
       episode_mask = tf.reduce_sum(tf.one_hot(
           rows, self._capacity, dtype=tf.int32), 0)
@@ -118,7 +138,6 @@ class EpisodeMemory(object):
 
   def data(self, rows=None):
     """Access a batch of episodes from the memory.
-
     Padding elements after the length of each episode are unspecified and might
     contain old data.
 
@@ -128,6 +147,11 @@ class EpisodeMemory(object):
     Returns:
       Tuple containing a tuple of transition quantiries with batch and time
       dimensions, and a batch of sequence lengths.
+
+      The return value is the episodes for the required environments (given by rows)
+      in current memory, one episode per environment, because current memory only stores
+      at most one episode per environment. The length of each episode is given by the second
+      element of the returned tuple, length.
     """
     rows = tf.range(self._capacity) if rows is None else rows
     assert rows.shape.ndims == 1

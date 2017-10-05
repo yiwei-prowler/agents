@@ -24,7 +24,9 @@ from agents.tools import streaming_mean
 
 
 def simulate(batch_env, algo, log=True, reset=False):
-  """Simulation step of a vecrotized algorithm with in-graph environments.
+  """Simulation a single step of a vecrotized algorithm with in-graph environments.
+  This means perform an action on all environments (environments that are not-started or
+  terminated are re-started to make sure that all environments are always available).
 
   Integrates the operations implemented by the algorithm and the environments
   into a combined operation.
@@ -52,10 +54,12 @@ def simulate(batch_env, algo, log=True, reset=False):
     assert agent_indices.shape.ndims == 1
     zero_scores = tf.zeros_like(agent_indices, tf.float32)
     zero_durations = tf.zeros_like(agent_indices)
+
     reset_ops = [
         batch_env.reset(agent_indices),
         tf.scatter_update(score, agent_indices, zero_scores),
         tf.scatter_update(length, agent_indices, zero_durations)]
+
     with tf.control_dependencies(reset_ops):
       return algo.begin_episode(agent_indices)
 
@@ -69,7 +73,9 @@ def simulate(batch_env, algo, log=True, reset=False):
     Returns:
       Summary tensor.
     """
+    # prevob is the list of observations, one per each environment.
     prevob = batch_env.observ + 0  # Ensure a copy of the variable value.
+    # Perform actions given observations on ALL environments.
     action, step_summary = algo.perform(prevob)
     action.set_shape(batch_env.action.shape)
     with tf.control_dependencies([batch_env.simulate(action)]):
@@ -113,30 +119,52 @@ def simulate(batch_env, algo, log=True, reset=False):
         lambda: tf.summary.scalar('mean_length', mean_length.clear()), str)
     return tf.summary.merge([score_summary, length_summary])
 
+  # Simulate a single step for all the environments.
+  # Restart environments that are done if necessary.
   with tf.name_scope('simulate'):
     log = tf.convert_to_tensor(log)
     reset = tf.convert_to_tensor(reset)
     with tf.variable_scope('simulate_temporary'):
-      score = tf.Variable(
-          tf.zeros(len(batch_env), dtype=tf.float32), False, name='score')
-      length = tf.Variable(
-          tf.zeros(len(batch_env), dtype=tf.int32), False, name='length')
+
+      score = tf.Variable(tf.zeros(len(batch_env), dtype=tf.float32), False, name='score')
+      length = tf.Variable(tf.zeros(len(batch_env), dtype=tf.int32), False, name='length')
+
     mean_score = streaming_mean.StreamingMean((), tf.float32)
     mean_length = streaming_mean.StreamingMean((), tf.float32)
+
+    # Find out the indices of environments which are done. or in the case reset is True,
+    # all the indices of environments.
     agent_indices = tf.cond(
         reset,
         lambda: tf.range(len(batch_env)),
         lambda: tf.cast(tf.where(batch_env.done)[:, 0], tf.int32))
+
+    # If some environments (given by agent_indices) are done,
+    # restart those environments.
     begin_episode = tf.cond(
         tf.cast(tf.shape(agent_indices)[0], tf.bool),
         lambda: _define_begin_episode(agent_indices), str)
+
+    # Simulate one step in all environments.
     with tf.control_dependencies([begin_episode]):
       step = _define_step()
+
+    # Find out which environments are done, and call end_episode on agents
+    # for those done environments. end_episode will trigger training if we are training
+    # and there is enough episode generated. Different environments may terminated at
+    # different time steps. Here we collect only the indices for environments that are terminated
+    # after the previous step. The triggering is in ppo.algorithm.PPOAlgorithm._define_end_episode.
+    # What does enough episode mean? In PPOAlgorithm, the _episodes tensor stores the episodes
+    # that is happening during simulation in environments. Once an environment has terminated,
+    # its episode is copied to the _memory tensor. When the size of the _memory tensor reaches
+    # config.update_every, it means there is enough training episodes to for the next batch
+    # of training, so training starts.
     with tf.control_dependencies([step]):
       agent_indices = tf.cast(tf.where(batch_env.done)[:, 0], tf.int32)
       end_episode = tf.cond(
           tf.cast(tf.shape(agent_indices)[0], tf.bool),
           lambda: _define_end_episode(agent_indices), str)
+
     with tf.control_dependencies([end_episode]):
       summary = tf.summary.merge([
           _define_summaries(), begin_episode, step, end_episode])

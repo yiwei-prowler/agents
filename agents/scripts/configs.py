@@ -28,7 +28,7 @@ def default():
   """Default configuration for PPO."""
   # General
   algorithm = ppo.PPOAlgorithm
-  num_agents = 10
+  num_agents = 10  # the number of parallel environments.
   eval_episodes = 25
   use_gpu = False
   # Network

@@ -58,7 +58,14 @@ def _create_environment(config):
 
 def _define_loop(graph, logdir, train_steps, eval_steps):
   """Create and configure a training loop with training and evaluation phases.
-
+  This defines the computation for each iteration of the loop. Each iteration consists
+  of two phases: the train phase and the evaluation phase:
+  1. the train phase simulate train_steps of steps in ALL environments. All environments
+     are moved by a single step synchronously, increasing the number of steps moved by the number
+     of environments. Afterwards, a number of episodes will be generated. Those episodes are used
+     to train the model.
+  2. the evaluation phase generates a bunch of episodes the same way as the train phase.
+     And those episodes are used to evaluate the model.
   Args:
     graph: Object providing graph elements via attributes.
     logdir: Log directory for storing checkpoints and summaries.
@@ -89,7 +96,7 @@ def _define_loop(graph, logdir, train_steps, eval_steps):
 def train(config, env_processes):
   """Training and evaluation entry point yielding scores.
 
-  Resolves some configuration attributes, creates environments, graph, and
+  Resolves some configurati on attributes, creates environments, graph, and
   training loop. By default, assigns all operations to the CPU.
 
   Args:
@@ -108,23 +115,53 @@ def train(config, env_processes):
   if config.update_every % config.num_agents:
     tf.logging.warn('Number of agents should divide episodes per update.')
   with tf.device('/cpu:0'):
+
     batch_env = utility.define_batch_env(
         lambda: _create_environment(config),
         config.num_agents, env_processes)
+
+    # graph represents the simulation of a single step in all environments.
     graph = utility.define_simulation_graph(
         batch_env, config.algorithm, config)
+
+    # Each iteration of this loop will move the environments train_steps forward, and
+    # eval_steps forward. The multiplier config.max_length makes sure that after
+    # moving train_steps, at least config.update_every number of episodes are generated.
+    # Note that train_steps is the total number of steps that ALL environments should be
+    # moved forward, and same as eval_steps, which is the total number of steps that
+    # ALL environments should be moved forward.
+    train_steps = config.update_every * config.max_length
+    eval_steps = config.eval_episodes * config.max_length
+
+    # The loop is like a while loop which loop over mini batches of training episodes and
+    # evaluation episodes. Training episodes and evaluation episodes are monte-carlo simulated.
+    # The process of each mini batch consists of a training over the training episodes
+    # and evaluations of the objective over the evaluation episodes. You can understand the
+    # loop as:
+    # steps_made = 0
+    # while steps_made < total_steps:
+    #    1. simulate at least config.update_every number of training episodes, increase
+    #       steps_made by the steps happened in simulation.
+    #    2. train the model with those training episodes.
+    #    3. simulate at least config.eval_episodes evaluation episodes, increase
+    #       steps_made by the steps happened in simulation.
+    #    4. evaluate the model with those evaluation episodes.
     loop = _define_loop(
         graph, config.logdir,
-        config.update_every * config.max_length,
-        config.eval_episodes * config.max_length)
+        train_steps=train_steps,
+        eval_steps=eval_steps)
+
     total_steps = int(
         config.steps / config.update_every *
         (config.update_every + config.eval_episodes))
+
   # Exclude episode related variables since the Python state of environments is
   # not checkpointed and thus new episodes start after resuming.
   saver = utility.define_saver(exclude=(r'.*_temporary/.*',))
   sess_config = tf.ConfigProto(allow_soft_placement=True)
   sess_config.gpu_options.allow_growth = True
+
+  #
   with tf.Session(config=sess_config) as sess:
     utility.initialize_variables(sess, saver, config.logdir)
     for score in loop.run(sess, saver, total_steps):

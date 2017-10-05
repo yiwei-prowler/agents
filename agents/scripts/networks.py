@@ -79,7 +79,7 @@ class RecurrentGaussianPolicy(tf.contrib.rnn.RNNCell):
   is learned as independent parameter vector. The last policy layer is recurrent
   and uses a GRU cell.
   """
-
+  # QQ: Why I cannot step in this method in Pycharm debugger?
   def __init__(
       self, policy_layers, value_layers, action_size,
       mean_weights_initializer=_MEAN_WEIGHTS_INITIALIZER,

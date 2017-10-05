@@ -64,9 +64,13 @@ class PPOAlgorithm(object):
         self._batch_env.observ[0], self._batch_env.action[0],
         self._batch_env.action[0], self._batch_env.action[0],
         self._batch_env.reward[0])
+
+    # self._memory stores the mini-batch of episodes used for training.
     self._memory = memory.EpisodeMemory(
         template, config.update_every, config.max_length, 'memory')
+    # self._memory_index points to the first un-used row in self._memory.
     self._memory_index = tf.Variable(0, False)
+
     use_gpu = self._config.use_gpu and utility.available_gpus()
     with tf.device('/gpu:0' if use_gpu else '/cpu:0'):
       # Create network variables for later calls to reuse.
@@ -75,6 +79,9 @@ class PPOAlgorithm(object):
           tf.ones(len(self._batch_env)), reuse=None)
       cell = self._config.network(self._batch_env.action.shape[1].value)
       with tf.variable_scope('ppo_temporary'):
+        # Create replay memory for experience records in episodes.
+        # Each environment store at most one episode. That's why its capacity is len(batch_env),
+        # the number of environments.
         self._episodes = memory.EpisodeMemory(
             template, len(batch_env), config.max_length, 'episodes')
         self._last_state = utility.create_nested_vars(
@@ -103,6 +110,9 @@ class PPOAlgorithm(object):
     """
     with tf.name_scope('begin_episode/'):
       reset_state = utility.reinit_nested_vars(self._last_state, agent_indices)
+      # At the beginning of episodes, first empty the self._episodes on the rows
+      # specified by agent_indices, because self._episodes can store only one episode
+      # per environments.
       reset_buffer = self._episodes.clear(agent_indices)
       with tf.control_dependencies([reset_state, reset_buffer]):
         return tf.constant('')
@@ -118,8 +128,17 @@ class PPOAlgorithm(object):
     """
     with tf.name_scope('perform/'):
       observ = self._observ_filter.transform(observ)
+      # observ[:, None], turns an array of observations [o], into an array of list of
+      # observations [[o]], this shape is needed by the underlying RNN.
+      # The second parameter tf.ones(observ.shape[0]) says that the length of each of
+      # the inner list of [[o]] is 1, which is obvious.
+
+      # observ[:, None] is of shape=(num_environments, 1, action_dimension)
+      # tf.ones(observ.shape[0]) tells that for every environment, the length of observation is 1.
       network = self._network(
           observ[:, None], tf.ones(observ.shape[0]), self._last_state)
+
+      # If we are training mode, we sample from the policy to make sure exploration.
       action = tf.cond(
           self._is_training, network.policy.sample, lambda: network.mean)
       logprob = network.policy.log_prob(action)[:, 0]
@@ -169,6 +188,10 @@ class PPOAlgorithm(object):
         # NOTE: Doesn't seem to change much.
         action = self._last_action
       batch = observ, action, self._last_mean, self._last_logstd, reward
+      # tf.range(len(self._batch_env)) gives the list of agent ids whose experiences
+      # will be appended. Here is all the agents' ids. Because we always move all
+      # environments together (environments that are terminated in the previous
+      # simulation step are restarted).
       append = self._episodes.append(batch, tf.range(len(self._batch_env)))
     with tf.control_dependencies([append]):
       norm_observ = self._observ_filter.transform(observ)
@@ -204,17 +227,37 @@ class PPOAlgorithm(object):
           lambda: self._define_end_episode(agent_indices), str)
 
   def _define_end_episode(self, agent_indices):
-    """Implement the branch of end_episode() entered during training."""
+    """
+    Implement the branch of end_episode() entered during training.
+    Args:
+        agent_indices: array of agent ids/environment ids that are done.
+    """
     episodes, length = self._episodes.data(agent_indices)
+
+    # self._memory can contain a maximum self._config.update_very number or rows.
+    # If the number of episodes given by agent_indices is larger than the empty rows
+    # in self._memory, we only use the first space_left number of episodes.
+    # What happens to the remaining unused episodes?
+    # They are thrown away, this is a bit of a waste.
     space_left = self._config.update_every - self._memory_index
     use_episodes = tf.range(tf.minimum(
         tf.shape(agent_indices)[0], space_left))
+
+    # This is the first few episodes.
     episodes = [tf.gather(elem, use_episodes) for elem in episodes]
+
+    # Here we add episodes into self_memory. use_episodes + self._memory_index
+    # generates the indices for still empty rows in self._memory.
     append = self._memory.replace(
         episodes, tf.gather(length, use_episodes),
         use_episodes + self._memory_index)
+
+    # Update self._memory_index, which is the number or rows in self._memory that
+    # has a valid episode.
     with tf.control_dependencies([append]):
       inc_index = self._memory_index.assign_add(tf.shape(use_episodes)[0])
+
+    # Perform training if self._memory is full.
     with tf.control_dependencies([inc_index]):
       memory_full = self._memory_index >= self._config.update_every
       return tf.cond(memory_full, self._training, str)
@@ -233,21 +276,32 @@ class PPOAlgorithm(object):
           self._memory_index, self._config.update_every)
       with tf.control_dependencies([assert_full]):
         data = self._memory.data()
+      # Each of the following variables, observ, action, old_mean, old_logstd, reward, length
+      # has self._config.update_every number of rows. They represent a mini batch of
+      # episodes that we used for training.
       (observ, action, old_mean, old_logstd, reward), length = data
       with tf.control_dependencies([tf.assert_greater(length, 0)]):
         length = tf.identity(length)
+
+      # Update policy.
       observ = self._observ_filter.transform(observ)
       reward = self._reward_filter.transform(reward)
       policy_summary = self._update_policy(
           observ, action, old_mean, old_logstd, reward, length)
+
+      # Update value.
       with tf.control_dependencies([policy_summary]):
         value_summary = self._update_value(observ, reward, length)
+
       with tf.control_dependencies([value_summary]):
         penalty_summary = self._adjust_penalty(
             observ, old_mean, old_logstd, length)
+
+      # Wipe out self._memory.
       with tf.control_dependencies([penalty_summary]):
         clear_memory = tf.group(
             self._memory.clear(), self._memory_index.assign(0))
+
       with tf.control_dependencies([clear_memory]):
         weight_summary = utility.variable_summaries(
             tf.trainable_variables(), self._config.weight_summaries)
@@ -547,9 +601,18 @@ class PPOAlgorithm(object):
       use_gpu = self._config.use_gpu and utility.available_gpus()
       with tf.device('/gpu:0' if use_gpu else '/cpu:0'):
         observ = tf.check_numerics(observ, 'observ')
+        # The argument to self._config.network, self._batch_env.action.shape[1].value, is the
+        # response dimension of the network.
+        # How does the network outputs actions for all environments, given observations?
+        # It is the same network, given different observations and initial states as inputs
+        # return different values. Just like you apply a function muptiple times with different
+        # inputs to get different outputs. And the outputs here are (mean, logstd, value), each
+        # element in the tuple has the first dimension as the environment id.
         cell = self._config.network(self._batch_env.action.shape[1].value)
+
         (mean, logstd, value), state = tf.nn.dynamic_rnn(
-            cell, observ, length, state, tf.float32, swap_memory=True)
+            cell=cell, inputs=observ, sequence_length=length,
+            initial_state=state, dtype=tf.float32, swap_memory=True)
       mean = tf.check_numerics(mean, 'mean')
       logstd = tf.check_numerics(logstd, 'logstd')
       value = tf.check_numerics(value, 'value')

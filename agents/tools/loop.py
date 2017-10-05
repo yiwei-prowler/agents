@@ -138,6 +138,8 @@ class Loop(object):
           self._is_every_steps(phase_step, phase.batch, phase.log_every))
       phase.feed[self._report] = (
           self._is_every_steps(phase_step, phase.batch, phase.report_every))
+      # Each phase moves number of environments steps (that is one step per environment).
+      # So global_step will be increased by the number of environments.
       summary, mean_score, global_step, steps_made = sess.run(
           phase.op, phase.feed)
       if self._is_every_steps(phase_step, phase.batch, phase.checkpoint_every):
@@ -194,6 +196,7 @@ class Loop(object):
     Args:
       done: Tensor indicating whether current score can be used.
       score: Tensor holding the current, possibly intermediate, score.
+        Shape of score is (num_of_environemnts,).
       summary: Tensor holding summary string to write if not an empty string.
 
     Returns:
@@ -211,6 +214,8 @@ class Loop(object):
           tf.reduce_any(done), lambda: score_mean.submit(done_score), tf.no_op)
     with tf.control_dependencies([submit_score]):
       mean_score = tf.cond(self._report, score_mean.clear, float)
+      # steps_made is the number of environments, which means that each environment
+      # is forwarded a single step.
       steps_made = tf.shape(score)[0]
       next_step = self._step.assign_add(steps_made)
     with tf.control_dependencies([mean_score, next_step]):
