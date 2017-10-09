@@ -23,7 +23,7 @@ import tensorflow as tf
 from agents.tools import streaming_mean
 
 
-def simulate(batch_env, algo, log=True, reset=False):
+def simulate(batch_env, algo, should_step, use_external_action, external_action, log=True, reset=False):
   """Simulation a single step of a vecrotized algorithm with in-graph environments.
   This means perform an action on all environments (environments that are not-started or
   terminated are re-started to make sure that all environments are always available).
@@ -76,16 +76,30 @@ def simulate(batch_env, algo, log=True, reset=False):
     # prevob is the list of observations, one per each environment.
     prevob = batch_env.observ + 0  # Ensure a copy of the variable value.
     # Perform actions given observations on ALL environments.
-    action, step_summary = algo.perform(prevob)
-    action.set_shape(batch_env.action.shape)
-    with tf.control_dependencies([batch_env.simulate(action)]):
-      add_score = score.assign_add(batch_env.reward)
-      inc_length = length.assign_add(tf.ones(len(batch_env), tf.int32))
-    with tf.control_dependencies([add_score, inc_length]):
-      experience_summary = algo.experience(
-          prevob, batch_env.action, batch_env.reward, batch_env.done,
-          batch_env.observ)
-    return tf.summary.merge([step_summary, experience_summary])
+
+    def _action_from_algo():
+        action, step_summary = algo.perform(prevob)
+        x = tf.Print(action, [action], 'This is internal action:')
+        with tf.control_dependencies([x]):
+            return action, step_summary
+
+    def _action_from_external():
+        x = tf.Print(external_action, [external_action], 'This is external action:')
+        with tf.control_dependencies([x]):
+            return external_action, tf.constant('')
+
+    action, step_summary = tf.cond(use_external_action, _action_from_external, _action_from_algo)
+    with tf.control_dependencies([action, step_summary]):
+        # action, step_summary = algo.perform(prevob)
+        action.set_shape(batch_env.action.shape)
+        with tf.control_dependencies([batch_env.simulate(action)]):
+          add_score = score.assign_add(batch_env.reward)
+          inc_length = length.assign_add(tf.ones(len(batch_env), tf.int32))
+        with tf.control_dependencies([add_score, inc_length]):
+          experience_summary = algo.experience(
+              prevob, batch_env.action, batch_env.reward, batch_env.done,
+              batch_env.observ)
+        return tf.summary.merge([step_summary, experience_summary])
 
   def _define_end_episode(agent_indices):
     """Notify the algorithm of ending episodes.
@@ -119,8 +133,40 @@ def simulate(batch_env, algo, log=True, reset=False):
         lambda: tf.summary.scalar('mean_length', mean_length.clear()), str)
     return tf.summary.merge([score_summary, length_summary])
 
+  def _perform_step():
+      step = _define_step()
+      # Find out which environments are done, and call end_episode on agents
+      # for those done environments. end_episode will trigger training if we are training
+      # and there is enough episode generated. Different environments may terminated at
+      # different time steps. Here we collect only the indices for environments that are terminated
+      # after the previous step. The triggering is in ppo.algorithm.PPOAlgorithm._define_end_episode.
+      # What does enough episode mean? In PPOAlgorithm, the _episodes tensor stores the episodes
+      # that is happening during simulation in environments. Once an environment has terminated,
+      # its episode is copied to the _memory tensor. When the size of the _memory tensor reaches
+      # config.update_every, it means there is enough training episodes to for the next batch
+      # of training, so training starts.
+      with tf.control_dependencies([step]):
+          agent_indices = tf.cast(tf.where(batch_env.done)[:, 0], tf.int32)
+          end_episode = tf.cond(
+              tf.cast(tf.shape(agent_indices)[0], tf.bool),
+              lambda: _define_end_episode(agent_indices), str)
+
+      with tf.control_dependencies([end_episode]):
+          summary = tf.summary.merge([
+              _define_summaries(), begin_episode, step, end_episode])
+      with tf.control_dependencies([summary]):
+          done, score2 = tf.identity(batch_env.done), tf.identity(score)
+      return done, score2, summary
+
+  def _donot_perform_step():
+      summary = tf.summary.merge([begin_episode])
+      with tf.control_dependencies([summary]):
+          done, score2 = tf.identity(batch_env.done), tf.identity(score)
+      return done, score2, summary
+
   # Simulate a single step for all the environments.
   # Restart environments that are done if necessary.
+
   with tf.name_scope('simulate'):
     log = tf.convert_to_tensor(log)
     reset = tf.convert_to_tensor(reset)
@@ -147,27 +193,36 @@ def simulate(batch_env, algo, log=True, reset=False):
 
     # Simulate one step in all environments.
     with tf.control_dependencies([begin_episode]):
-      step = _define_step()
+      return tf.cond(should_step, _perform_step, _donot_perform_step)
 
-    # Find out which environments are done, and call end_episode on agents
-    # for those done environments. end_episode will trigger training if we are training
-    # and there is enough episode generated. Different environments may terminated at
-    # different time steps. Here we collect only the indices for environments that are terminated
-    # after the previous step. The triggering is in ppo.algorithm.PPOAlgorithm._define_end_episode.
-    # What does enough episode mean? In PPOAlgorithm, the _episodes tensor stores the episodes
-    # that is happening during simulation in environments. Once an environment has terminated,
-    # its episode is copied to the _memory tensor. When the size of the _memory tensor reaches
-    # config.update_every, it means there is enough training episodes to for the next batch
-    # of training, so training starts.
-    with tf.control_dependencies([step]):
-      agent_indices = tf.cast(tf.where(batch_env.done)[:, 0], tf.int32)
-      end_episode = tf.cond(
-          tf.cast(tf.shape(agent_indices)[0], tf.bool),
-          lambda: _define_end_episode(agent_indices), str)
+    #   step = _define_step()
+    #
+    # # Find out which environments are done, and call end_episode on agents
+    # # for those done environments. end_episode will trigger training if we are training
+    # # and there is enough episode generated. Different environments may terminated at
+    # # different time steps. Here we collect only the indices for environments that are terminated
+    # # after the previous step. The triggering is in ppo.algorithm.PPOAlgorithm._define_end_episode.
+    # # What does enough episode mean? In PPOAlgorithm, the _episodes tensor stores the episodes
+    # # that is happening during simulation in environments. Once an environment has terminated,
+    # # its episode is copied to the _memory tensor. When the size of the _memory tensor reaches
+    # # config.update_every, it means there is enough training episodes to for the next batch
+    # # of training, so training starts.
+    # with tf.control_dependencies([step]):
+    #   agent_indices = tf.cast(tf.where(batch_env.done)[:, 0], tf.int32)
+    #   end_episode = tf.cond(
+    #       tf.cast(tf.shape(agent_indices)[0], tf.bool),
+    #       lambda: _define_end_episode(agent_indices), str)
+    #
+    # with tf.control_dependencies([end_episode]):
+    #   summary = tf.summary.merge([
+    #       _define_summaries(), begin_episode, step, end_episode])
+    # with tf.control_dependencies([summary]):
+    #   done, score = tf.identity(batch_env.done), tf.identity(score)
+    # return done, score, summary
 
-    with tf.control_dependencies([end_episode]):
-      summary = tf.summary.merge([
-          _define_summaries(), begin_episode, step, end_episode])
-    with tf.control_dependencies([summary]):
-      done, score = tf.identity(batch_env.done), tf.identity(score)
-    return done, score, summary
+    # else:
+    #     with tf.control_dependencies([begin_episode]):
+    #         summary = tf.summary.merge([begin_episode])
+    #         with tf.control_dependencies([summary]):
+    #             done, score = tf.identity(batch_env.done), tf.identity(score)
+    #         return done, score, summary

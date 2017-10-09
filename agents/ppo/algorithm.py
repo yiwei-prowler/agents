@@ -605,7 +605,7 @@ class PPOAlgorithm(object):
         # response dimension of the network.
         # How does the network outputs actions for all environments, given observations?
         # It is the same network, given different observations and initial states as inputs
-        # return different values. Just like you apply a function muptiple times with different
+        # return different values. Just like you apply a function multiple times with different
         # inputs to get different outputs. And the outputs here are (mean, logstd, value), each
         # element in the tuple has the first dimension as the environment id.
         cell = self._config.network(self._batch_env.action.shape[1].value)

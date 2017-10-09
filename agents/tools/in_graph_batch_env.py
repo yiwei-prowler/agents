@@ -41,6 +41,8 @@ class InGraphBatchEnv(object):
     observ_dtype = self._parse_dtype(self._batch_env.observation_space)
     action_shape = self._parse_shape(self._batch_env.action_space)
     action_dtype = self._parse_dtype(self._batch_env.action_space)
+    self.action_info = action_dtype, (len(self._batch_env),) + action_shape
+
     with tf.variable_scope('env_temporary'):
       self._observ = tf.Variable(
           tf.zeros((len(self._batch_env),) + observ_shape, observ_dtype),

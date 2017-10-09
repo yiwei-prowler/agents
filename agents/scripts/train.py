@@ -23,6 +23,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import numpy as np
 import datetime
 import functools
 import os
@@ -56,7 +57,7 @@ def _create_environment(config):
   return env
 
 
-def _define_loop(graph, logdir, train_steps, eval_steps):
+def _define_loop(graph, logdir, train_steps, eval_steps, batch_env):
   """Create and configure a training loop with training and evaluation phases.
   This defines the computation for each iteration of the loop. Each iteration consists
   of two phases: the train phase and the evaluation phase:
@@ -75,6 +76,8 @@ def _define_loop(graph, logdir, train_steps, eval_steps):
   Returns:
     Loop object.
   """
+
+  default_external_action = np.zeros(batch_env.action_info[1])
   loop = tools.Loop(
       logdir, graph.step, graph.should_log, graph.do_report,
       graph.force_reset)
@@ -83,13 +86,16 @@ def _define_loop(graph, logdir, train_steps, eval_steps):
       report_every=None,
       log_every=train_steps // 2,
       checkpoint_every=None,
-      feed={graph.is_training: True})
+      feed={
+          graph.is_training: True, graph.should_step: True, graph.use_external_action: False,
+          graph.external_action: default_external_action})
   loop.add_phase(
       'eval', graph.done, graph.score, graph.summary, eval_steps,
       report_every=eval_steps,
       log_every=eval_steps // 2,
       checkpoint_every=10 * eval_steps,
-      feed={graph.is_training: False})
+      feed={graph.is_training: False, graph.should_step: True, graph.use_external_action: False,
+            graph.external_action: default_external_action})
   return loop
 
 
@@ -149,7 +155,7 @@ def train(config, env_processes):
     loop = _define_loop(
         graph, config.logdir,
         train_steps=train_steps,
-        eval_steps=eval_steps)
+        eval_steps=eval_steps, batch_env=batch_env)
 
     total_steps = int(
         config.steps / config.update_every *
